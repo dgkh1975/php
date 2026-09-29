@@ -2,17 +2,7 @@
 set -Eeuo pipefail
 
 declare -A aliases=(
-	[7.4]='7'
-	[8.1]='8 latest'
-)
-
-defaultDebianSuite='bullseye'
-declare -A debianSuites=(
-	#[7.4]='buster'
-)
-defaultAlpineVersion='3.15'
-declare -A alpineVersions=(
-	#[8.1]='3.15'
+	[8.5]='8 latest'
 )
 
 self="$(basename "$BASH_SOURCE")"
@@ -50,17 +40,19 @@ dirCommit() {
 
 getArches() {
 	local repo="$1"; shift
-	local officialImagesUrl='https://github.com/docker-library/official-images/raw/master/library/'
+	local officialImagesBase="${BASHBREW_LIBRARY:-https://github.com/docker-library/official-images/raw/HEAD/library}/"
 
-	eval "declare -g -A parentRepoToArches=( $(
-		find -name 'Dockerfile' -exec awk '
+	local parentRepoToArchesStr
+	parentRepoToArchesStr="$(
+		find -name 'Dockerfile' -exec awk -v officialImagesBase="$officialImagesBase" '
 				toupper($1) == "FROM" && $2 !~ /^('"$repo"'|scratch|.*\/.*)(:|$)/ {
-					print "'"$officialImagesUrl"'" $2
+					printf "%s%s\n", officialImagesBase, $2
 				}
 			' '{}' + \
 			| sort -u \
-			| xargs bashbrew cat --format '[{{ .RepoName }}:{{ .TagName }}]="{{ join " " .TagEntry.Architectures }}"'
-	) )"
+			| xargs -r bashbrew cat --format '["{{ .RepoName }}:{{ .TagName }}"]="{{ join " " .TagEntry.Architectures }}"'
+	)"
+	eval "declare -g -A parentRepoToArches=( $parentRepoToArchesStr )"
 }
 getArches 'php'
 
@@ -105,6 +97,28 @@ for version; do
 		${aliases[$version]:-}
 	)
 
+	defaultDebianVariant="$(jq -r '
+		.[env.version].variants
+		| map(
+			split("/")[0]
+			| select(
+				startswith("alpine")
+				| not
+			)
+		)
+		| .[0]
+	' versions.json)"
+	defaultAlpineVariant="$(jq -r '
+		.[env.version].variants
+		| map(
+			split("/")[0]
+			| select(
+				startswith("alpine")
+			)
+		)
+		| .[0]
+	' versions.json)"
+
 	for dir in "${variants[@]}"; do
 		suite="$(dirname "$dir")" # "buster", etc
 		variant="$(basename "$dir")" # "cli", etc
@@ -119,9 +133,9 @@ for version; do
 		fi
 
 		suiteVariantAliases=( "${variantAliases[@]/%/-$suite}" )
-		if [ "${suite#alpine}" = "${alpineVersions[$version]:-$defaultAlpineVersion}" ] ; then
+		if [ "$suite" = "$defaultAlpineVariant" ] ; then
 			variantAliases=( "${variantAliases[@]/%/-alpine}" )
-		elif [ "$suite" != "${debianSuites[$version]:-$defaultDebianSuite}" ]; then
+		elif [ "$suite" != "$defaultDebianVariant" ]; then
 			variantAliases=()
 		fi
 		variantAliases=( "${suiteVariantAliases[@]}" ${variantAliases[@]+"${variantAliases[@]}"} )
@@ -129,6 +143,17 @@ for version; do
 
 		variantParent="$(awk 'toupper($1) == "FROM" { print $2 }' "$dir/Dockerfile")"
 		variantArches="${parentRepoToArches[$variantParent]}"
+
+		# php segfaults on arm32v6 for these pre-releases
+		# https://github.com/docker-library/php/issues/1675
+		if [[ "$suite" =~ 'alpine'* ]]; then
+			if [[ "$fullVersion" == '8.6.0beta'* ]]; then
+				variantArches="$(jq <<<"$variantArches" --raw-input --raw-output '
+					split(" ") - [ "arm32v6" ]
+					| join(" ")
+				')"
+			fi
+		fi
 
 		commit="$(dirCommit "$dir")"
 

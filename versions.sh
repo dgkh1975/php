@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 cd "$(dirname "$(readlink -f "$BASH_SOURCE")")"
 
+# TODO consume https://www.php.net/releases/branches.php and https://www.php.net/pre-release-builds.php?format=json here like in Go, Julia, etc (so we can have a canonical "here's all the versions possible" mode, and more automated metadata like EOL 👀)
+
 versions=( "$@" )
 if [ ${#versions[@]} -eq 0 ]; then
 	versions=( */ )
@@ -11,6 +13,8 @@ else
 	json="$(< versions.json)"
 fi
 versions=( "${versions[@]%/}" )
+
+now="$(date --utc '+%s')"
 
 for version in "${versions[@]}"; do
 	rcVersion="${version%-rc}"
@@ -31,7 +35,7 @@ for version in "${versions[@]}"; do
 			) ]
 		'
 	else
-		apiUrl='https://qa.php.net/api.php?type=qa-releases&format=json'
+		apiUrl='https://www.php.net/pre-release-builds.php?format=json'
 		apiJqExpr='
 			(.releases // [])[]
 			| select(.version | startswith(env.rcVersion))
@@ -43,6 +47,7 @@ for version in "${versions[@]}"; do
 			]
 		'
 	fi
+	apiUrl+="&cachebuster=$now" # combat over-aggressive cache on php.net
 	IFS=$'\n'
 	possibles=( $(
 		curl -fsSL "$apiUrl" \
@@ -52,16 +57,9 @@ for version in "${versions[@]}"; do
 	unset IFS
 
 	if [ "${#possibles[@]}" -eq 0 ]; then
-		if [ "$rcVersion" = "$version" ]; then
-			echo >&2
-			echo >&2 "error: unable to determine available releases of $version"
-			echo >&2
-			exit 1
-		else
-			echo >&2 "warning: skipping/removing '$version' (does not appear to exist upstream)"
-			json="$(jq <<<"$json" -c '.[env.version] = null')"
-			continue
-		fi
+		echo >&2 "warning: skipping/removing '$version' (does not appear to exist upstream)"
+		json="$(jq <<<"$json" -c '.[env.version] = null')"
+		continue
 	fi
 
 	# format of "possibles" array entries is "VERSION URL.TAR.XZ URL.TAR.XZ.ASC SHA256" (each value shell quoted)
@@ -72,52 +70,59 @@ for version in "${versions[@]}"; do
 	ascUrl="${possi[2]}"
 	sha256="${possi[3]}"
 
-	if ! wget -q --spider "$url"; then
+	if ! curl --head -fsSL "$url" -o /dev/null; then
 		echo >&2 "error: '$url' appears to be missing"
 		exit 1
 	fi
 
-	# if we don't have a .asc URL, let's see if we can figure one out :)
-	if [ -z "$ascUrl" ] && wget -q --spider "$url.asc"; then
+	# if we don't have a .asc URL, let's just assume one :)
+	if [ -z "$ascUrl" ]; then
 		ascUrl="$url.asc"
 	fi
-
-	variants='[]'
-	# order here controls the order of the library/ file
-	for suite in \
-		bullseye \
-		buster \
-		alpine3.15 \
-		alpine3.14 \
-	; do
-		for variant in cli apache fpm zts; do
-			if [[ "$suite" = alpine* ]]; then
-				if [ "$variant" = 'apache' ]; then
-					continue
-				elif [ "$variant" = 'zts' ] && [[ "$rcVersion" != 7.* ]]; then
-					# https://github.com/docker-library/php/issues/1074
-					continue
-				fi
-			fi
-			export suite variant
-			variants="$(jq <<<"$variants" -c '. + [ env.suite + "/" + env.variant ]')"
-		done
-	done
 
 	echo "$version: $fullVersion"
 
 	export fullVersion url ascUrl sha256
 	json="$(
-		jq <<<"$json" -c \
-			--argjson variants "$variants" \
-			'.[env.version] = {
+		jq <<<"$json" -c '
+			.[env.version] = {
 				version: env.fullVersion,
 				url: env.url,
 				ascUrl: env.ascUrl,
 				sha256: env.sha256,
-				variants: $variants,
-			}'
+				variants: [
+					# order here controls the order of the library/ file
+					(
+						"trixie",
+						"bookworm",
+						"alpine3.24",
+						"alpine3.23",
+						empty
+					) as $suite
+					| (
+						"cli",
+						"apache",
+						"fpm",
+						(if env.rcVersion | IN("8.2", "8.3", "8.4", "8.5") then "zts" else empty end),
+						empty
+					) as $variant
+					| if $suite | startswith("alpine") and $variant == "apache" then empty else
+						"\($suite)/\($variant)"
+					end
+				],
+			}
+		'
 	)"
+
+	# make sure RCs and releases have corresponding pairs
+	json="$(jq <<<"$json" -c '
+		.[
+			env.version
+			+ if env.version == env.rcVersion then
+				"-rc"
+			else "" end
+		] //= null
+	')"
 done
 
-jq <<<"$json" -S . > versions.json
+jq <<<"$json" 'to_entries | sort_by(.key) | from_entries' > versions.json
